@@ -343,3 +343,51 @@ already a deliberate choice for this exact reason), and Colab's free-tier
 CPU allocation (~2 vCPUs) may not beat the local machine's core count for
 `SubprocVecEnv` parallelism — the actual motivation here is protecting the
 laptop, not raw speed, which is a valid reason on its own.
+
+Set up: `git init`'d this project directory (previously not a git repo),
+pushed to `https://github.com/kaustubhadhe1206/Arm-OSC-Grasp.git` (chosen
+over Google Drive sync or inline-in-notebook alternatives — cleanest,
+survives Colab runtime resets automatically). `venv/`, `checkpoints/`, and
+`*.zip` are gitignored; the Panda mesh assets (34MB, well under GitHub's
+limits) were committed directly rather than re-cloned from Menagerie
+separately in Colab, to avoid any risk of a version/path mismatch with the
+custom `tcp` site added to `panda.xml`.
+
+## Incident #12 — Gripper chattering/"shivering" near the object
+
+**Symptom:** testing a 350k-step checkpoint (first run on Colab, with
+incidents #9-#11's reward fixes in place) showed a new behavior: the arm
+approached the cube, the gripper closed partway without grabbing it, then
+immediately loosened and started visibly vibrating/"shivering" rather than
+settling into a stable attempt.
+
+**Diagnosis:** classic action-chattering, and a plausible NEW exploit of
+incident #11's own fix specifically: that fix pays a small dense reward for
+ANY nonzero lift height while touching+closed (added to give a gradient
+below the full lift threshold). If rapidly buzzing the gripper against the
+object causes small physics-contact bounces, each bounce reads as a
+nonzero height and pays out that reward repeatedly — potentially easier
+for the policy to farm via high-frequency contact events than to commit to
+one careful, sustained grasp attempt.
+
+**Fix (`envs/franka_osc_grasp_env.py`):** added a general action-smoothness
+penalty — `reward -= 0.05 * ||normalized_action_t - normalized_action_{t-1}||`
+(normalized per-dimension by the action space's own range, since dx/dy/dz
+are meters, dyaw is radians, and dgripper is meters — different scales that
+would otherwise let one dimension dominate). This is standard practice in
+robotics RL specifically to suppress chattering, and doesn't depend on the
+exploit hypothesis above being exactly right — rapid oscillation is
+undesirable regardless of what's motivating it.
+
+**Status:** not yet verified. Training is now running on Colab (see
+below), not locally, so restarting requires the user to interrupt the
+training cell, pull the latest code, and re-run — I can no longer just
+stop/restart a local background process myself for this run.
+
+Added `colab_train.ipynb` (this project's first and only `.ipynb` —
+overriding the original "no ipynb files" instruction, which was written
+for local-only training and predates the laptop-heat/Colab decision).
+Mounts Google Drive and symlinks `checkpoints/` to a Drive folder before
+running `train_osc_grasp_parallel.py` unchanged, so checkpoints survive a
+Colab disconnect (the local Colab disk is wiped on disconnect/recycle,
+which a multi-hour run will eventually hit).

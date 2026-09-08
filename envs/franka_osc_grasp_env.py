@@ -210,11 +210,35 @@ class FrankaOSCGraspEnv(gymnasium.Env):
         self.target_pos = self.data.site_xpos[self.tip_id].copy()
         self.target_yaw = 0.0
 
+        # for the action-smoothness penalty in step() — no previous action
+        # to compare against yet, so start at the zero action (no penalty
+        # on the episode's first step)
+        self.prev_action_normalized = np.zeros(5, dtype=np.float32)
+
         return self._get_obs(), {}
 
     def step(self, action):
         action = np.clip(action, self.action_space.low, self.action_space.high)
         dx, dy, dz, dyaw, dgripper = action
+
+        # Penalize rapid action-to-action changes (normalized per-dimension
+        # by the action space's own range, since dx/dy/dz are in meters,
+        # dyaw in radians, and dgripper in meters — different scales that
+        # would otherwise let one dimension dominate this term). Added
+        # after observing a trained checkpoint's gripper start visibly
+        # vibrating/"shivering" near the object instead of committing to a
+        # grasp — classic action-chattering, and a plausible new exploit of
+        # incident #11's fix: if rapidly buzzing the gripper against the
+        # object causes small physics-contact bounces, each bounce reads as
+        # a nonzero lift height and pays out that fix's dense sub-threshold
+        # reward repeatedly, potentially easier to farm than a real,
+        # patient grasp attempt. This penalty makes chattering costly
+        # regardless of what's motivating it — standard practice in
+        # robotics RL specifically to suppress this failure mode.
+        normalized_action = action / self.action_space.high
+        action_change = np.linalg.norm(normalized_action - self.prev_action_normalized)
+        action_smoothness_penalty = 0.05 * action_change
+        self.prev_action_normalized = normalized_action
 
         self.target_pos = np.clip(
             self.target_pos + np.array([dx, dy, dz], dtype=np.float32),
@@ -250,6 +274,7 @@ class FrankaOSCGraspEnv(gymnasium.Env):
 
         reward = -distance
         reward += 0.1 * np.exp(-distance / self.close_scale)
+        reward -= action_smoothness_penalty
 
         left_contact = False
         right_contact = False
