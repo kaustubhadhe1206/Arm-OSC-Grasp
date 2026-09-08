@@ -38,11 +38,36 @@ def key_callback(keycode):
         print("Paused" if paused["value"] else "Resumed")
 
 
+def draw_spawn_box(viewer, env):
+    """Overlays a flat, semi-transparent marker over the object's spawn
+    region (env.object_spawn_x_range / object_spawn_y_range) using
+    MuJoCo's "user scene" — a viewer-only decoration layer, not a physical
+    geom in the model, so it draws from the SAME numbers the env actually
+    samples from (no risk of a hardcoded XML marker drifting out of sync
+    with a later change to those ranges) and has no collision/physics
+    effect at all."""
+    x_min, x_max = env.object_spawn_x_range
+    y_min, y_max = env.object_spawn_y_range
+    center = np.array([(x_min + x_max) / 2, (y_min + y_max) / 2, 0.001])
+    half_size = np.array([(x_max - x_min) / 2, (y_max - y_min) / 2, 0.0005])
+
+    viewer.user_scn.ngeom = 1
+    mujoco.mjv_initGeom(
+        viewer.user_scn.geoms[0],
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        size=half_size,
+        pos=center,
+        mat=np.eye(3).flatten(),
+        rgba=np.array([0.2, 1.0, 0.2, 0.35], dtype=np.float32),
+    )
+
+
 model = SAC.load(model_path, env=env)
 
 with mujoco.viewer.launch_passive(env.model, env.data, key_callback=key_callback) as viewer:
 
     obs, info = env.reset()
+    draw_spawn_box(viewer, env)
 
     while viewer.is_running():
 
