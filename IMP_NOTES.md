@@ -331,6 +331,68 @@ smaller scale.
 **Status:** not yet verified — see below, training paused entirely while
 migrating off the local machine.
 
+## Incident #13 — Scripted sanity check: environment is achievable, controller was the real bottleneck
+
+**Context:** after three training runs and four rounds of reward-shaping
+fixes (#9-#12) never once produced a successful grasp, wrote
+`scripted_grasp_check.py` — a hand-coded, NO-RL routine (move above
+object, descend, close, lift, hold) using simple proportional
+waypoint-following through the environment's own action interface. Purpose:
+decisively separate "the environment/reward isn't achievable" from "RL
+hasn't found it yet," which training logs alone can't distinguish.
+
+**Finding #1 — the controller was far too slow for the episode budget.**
+The first script version showed `env.target_pos` (a raw accumulator)
+reaching a waypoint almost instantly while the actual arm (`tip_pos`)
+barely moved — e.g. commanding a ~0.45m move and finding the tip had
+covered only ~2.5cm after 360 physics steps. Traced this to
+`max_ref_lag=0.025` (tuned during the controller's own standalone
+verification purely for stability — see incident #7) being far more
+conservative than necessary: a direct sweep from 0.025 to 0.15 showed NO
+oscillation or instability reappearing anywhere in that range (unlike the
+earlier per-element-clipping and frame bugs, which caused genuine
+divergence) — just gracefully growing steady-state error (2.7mm at 0.025
+to ~14mm at 0.15). Raised to `max_ref_lag=0.06`: settles the same ~0.5m
+move in ~2.6s instead of ~6.3s (2.4x faster) while keeping error under
+~6.5mm, comfortably precise enough for a 3cm object. This means **every
+prior training run may have been budget-starved on the approach phase
+alone**, independent of whatever reward-shaping issues were also present —
+a likely-dominant, previously invisible bottleneck.
+
+Standalone controller test tolerances relaxed accordingly (5mm/1.1deg ->
+10mm/1.5deg — still far tighter than this task needs) and re-verified: all
+5 targets still pass.
+
+**Finding #2 — two bugs in the sanity-check script itself, not the
+environment.** (1) `move_to()`'s early-exit checked `env.target_pos`
+instead of the actual tip position, so it exited after ~10-15 steps
+thinking it had arrived while the real arm was still far away — a
+misleading result that looked like a controller failure but wasn't. (2)
+After fixing that, gripper-closing (Phase 3) reused `move_to()`, whose
+POSITION-based early exit fired almost immediately (the arm was already
+where it needed to be from the previous phase), giving the gripper only
+1-2 steps instead of a real chance to close. Split into a dedicated
+`close_gripper()` helper that tracks the gripper's own convergence
+(stops once further closing has near-zero effect) instead of the arm's.
+Also found the grasp height needed a small margin above the object's exact
+center (`+0.01`) rather than dead-center, since the controller's ~5-10mm
+steady-state error made targeting the exact center risk the fingertips
+jamming against the floor.
+
+**Result: with all of the above fixed, the scripted routine succeeded
+(full grasp-lift-hold to termination) in 3/3 runs**, using
+`max_episode_steps=300` with room to spare (~180-200 steps typically
+used). This decisively confirms the environment, reward, and success
+condition are all correctly configured and achievable — the dominant
+blocker across every prior training run was very likely the controller's
+speed, not (only) reward shaping.
+
+**Status:** training restarted from scratch (again) with `max_ref_lag=0.06`
+combined with all of incidents #9-#12's reward fixes and the fixed spawn
+box/episode length from this session. This is the first run with a
+confirmed-achievable configuration underneath it, not just a reward patch
+on top of an unverified environment.
+
 ## Local training paused — migrating to Google Colab
 
 User's laptop was overheating from sustained local training; decided to

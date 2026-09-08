@@ -21,13 +21,16 @@ class FrankaOSCGraspEnv(gymnasium.Env):
     DiffIKController converts it into joint-angle references for the
     Panda's existing position-controlled actuators.
 
-    The object/success/reward design (real physical object, annulus
-    spawning, contact+closure+lift-height success verification, reward
-    shaping and clipping) is carried over from 4-arm_project's
-    FrankaGraspEnv nearly unchanged — only the ARM control mechanism
-    changed. See IMP_NOTES.md for why: OSC was adopted specifically to
-    remove the joint-coordination burden from the policy, not to redesign
-    the grasp-success criteria, which were independently hard-won.
+    The object/success/reward design (real physical object,
+    contact+closure+lift-height success verification, reward shaping and
+    clipping) is carried over from 4-arm_project's FrankaGraspEnv, with the
+    reward independently iterated on further here (see IMP_NOTES.md
+    incidents #9-#12) after repeated training runs never once completed a
+    successful grasp-and-hold. The object now spawns in a small FIXED box
+    on one side of the robot rather than an annulus spanning the whole
+    reachable area (also IMP_NOTES.md) — a deliberate simplification to
+    remove position-generalization difficulty while the actual open
+    problem (committing to and holding a grasp, not reaching) is worked on.
     """
 
     def __init__(self, use_camera=False, camera_size=128):
@@ -128,13 +131,19 @@ class FrankaOSCGraspEnv(gymnasium.Env):
         # commands small incremental deltas, not single large jumps.
         self.n_substeps = 20
 
-        # object spawns within this annulus (ring) on the floor, around the
-        # base. object_radius_min clears the robot's own base — its largest
-        # visual geom has a bounding sphere radius of ~0.19m
-        # (model.geom_rbound). object_radius_max keeps the target comfortably
-        # inside the arm's ~0.9m true max reach.
-        self.object_radius_min = 0.25
-        self.object_radius_max = 0.5
+        # object spawns within this FIXED box on one side of the robot,
+        # rather than anywhere in an annulus around it — a deliberate
+        # simplification (see IMP_NOTES.md) after repeated training runs
+        # never once succeeded even at grasp-and-hold: narrowing the
+        # position variability the policy has to generalize over removes
+        # one axis of difficulty while the actual open problem (committing
+        # to a stable grasp, not reaching) gets worked on. Bounds keep the
+        # box comfortably clear of the robot's own base (its largest visual
+        # geom has a ~0.19m bounding sphere radius, model.geom_rbound) and
+        # well inside the arm's ~0.9m true max reach — this box's corners
+        # are all within a 0.34-0.54m radius of the base.
+        self.object_spawn_x_range = (0.30, 0.45)
+        self.object_spawn_y_range = (0.15, 0.30)
         self.object_floor_z = 0.015  # half the box's side length, resting flush on the floor
 
         # distance (meters) scale for the proximity reward shaping
@@ -149,8 +158,17 @@ class FrankaOSCGraspEnv(gymnasium.Env):
         self.grasp_hold_required = 20
         self.grasp_hold_counter = 0
 
-        # max env steps per episode
-        self.max_episode_steps = 500
+        # max env steps per episode. At n_substeps=20 (40ms/step), 300 steps
+        # = 12 simulated seconds — enough slack for approach (now short and
+        # predictable, given the fixed nearby spawn box) + grasp + lift +
+        # the mandatory 20-step (0.8s) hold, without wasting many steps
+        # lingering in an already-failed episode. Lowered from 500 (20s):
+        # across three full training runs, not one episode ever succeeded,
+        # so a shorter cap trades a bit of end-of-episode slack for more
+        # episode RESETS per unit of total training steps — more diverse
+        # attempts, which matters more than a longer leash for a policy
+        # that has not yet found the target behavior at all.
+        self.max_episode_steps = 300
         self.current_step = 0
 
         # lazily-created offscreen renderer for the wired-up camera (Phase 4)
@@ -179,17 +197,14 @@ class FrankaOSCGraspEnv(gymnasium.Env):
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:9] = self.home_qpos_arm
 
-        # randomize the object's position anywhere inside the annulus
-        # (object_radius_min to object_radius_max) on the floor, around the
-        # base. Sampling r^2 uniformly makes this uniform over AREA.
-        # Uses self.np_random (gymnasium's seeded RNG, set up by
-        # super().reset(seed=seed) above), not the global np.random — the
-        # global generator ignores the seed argument entirely, which
-        # gymnasium's own check_env() catches via a step-determinism test.
-        radius = np.sqrt(self.np_random.uniform(self.object_radius_min**2, self.object_radius_max**2))
-        azimuth = self.np_random.uniform(0.0, 2 * np.pi)
-        object_x = radius * np.cos(azimuth)
-        object_y = radius * np.sin(azimuth)
+        # randomize the object's position uniformly within the fixed spawn
+        # box (see __init__'s comment). Uses self.np_random (gymnasium's
+        # seeded RNG, set up by super().reset(seed=seed) above), not the
+        # global np.random — the global generator ignores the seed argument
+        # entirely, which gymnasium's own check_env() catches via a
+        # step-determinism test.
+        object_x = self.np_random.uniform(*self.object_spawn_x_range)
+        object_y = self.np_random.uniform(*self.object_spawn_y_range)
 
         yaw = self.np_random.uniform(0.0, 2 * np.pi)
         quat = [np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)]

@@ -27,7 +27,7 @@ class DiffIKController:
     def __init__(self, model, data, site_id, n_arm_joints=7,
                  position_gain=1.0, orientation_gain=1.0,
                  damping=1e-4, max_joint_delta=0.01,
-                 home_qpos=None, nullspace_gain=0.5, max_ref_lag=0.025):
+                 home_qpos=None, nullspace_gain=0.5, max_ref_lag=0.06):
         self.model = model
         self.data = data
         self.site_id = site_id
@@ -76,6 +76,24 @@ class DiffIKController:
         # enough lead to build real PD restoring torque (needed — see
         # solve()'s docstring for why zero lag has the opposite problem)
         # while guaranteeing the reference can never run away from reality.
+        #
+        # Raised from the original 0.025 to 0.06 after a hand-scripted
+        # grasp sanity check (scripted_grasp_check.py) revealed the ARM
+        # barely moved within a full training episode's step budget: at
+        # 0.025, settling a ~0.5m move (home to the object) took ~6.3
+        # real seconds — most of a 300-step (12s) episode consumed by
+        # approach alone, before grasping could even begin. Every prior
+        # training run may have been budget-starved on approach, not just
+        # struggling with reward shaping. Swept 0.025 to 0.15 directly: no
+        # oscillation/instability reappeared anywhere in that range (unlike
+        # the earlier per-element-clipping and frame bugs, which caused
+        # genuine unbounded or oscillating divergence) — residual tracking
+        # error grows gracefully with lag (2.7mm at 0.025 to ~14mm at
+        # 0.15), so this is a smooth speed/precision trade, not a
+        # stability cliff. 0.06 settles the same ~0.5m move in ~2.6s
+        # (2.4x faster) while keeping steady-state error under ~6.5mm —
+        # comfortably precise enough for a 3cm object and 5cm lift
+        # threshold.
         self.max_ref_lag = max_ref_lag
 
         self._jacp = np.zeros((3, model.nv))

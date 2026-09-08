@@ -16,8 +16,14 @@ from osc_controller import DiffIKController, down_facing_quat
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "envs", "panda", "panda_grasp.xml")
 
 STEPS_PER_TARGET = 8000
-POS_TOL = 0.005   # 5mm
-ORI_TOL = 0.02    # rad, ~1.1 degrees
+# Tolerances relaxed alongside max_ref_lag's increase (0.025 -> 0.06 — see
+# osc_controller.py's __init__ comment): that traded some steady-state
+# precision for ~2.4x faster settling, since a full training episode's
+# step budget was being consumed by slow approach alone. 10mm/1.5deg is
+# still far tighter than this task actually needs (a 3cm object, 5cm lift
+# threshold).
+POS_TOL = 0.010   # 10mm
+ORI_TOL = 0.026   # rad, ~1.5 degrees
 
 
 def run_to_target(model, data, controller, desired_pos, desired_quat, label):
