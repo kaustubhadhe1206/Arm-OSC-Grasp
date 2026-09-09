@@ -431,6 +431,88 @@ threaten the achievability finding from incident #13.
 **Status:** not yet verified — training restarted from scratch again
 (reward function changed).
 
+## Incident #15 — Pivoted to behavior-cloning warm-start after 585k steps of pure RL found zero successes
+
+**Context:** the run built on incidents #13/#14's fixes (fast controller,
+fixed+widened spawn box, gripper-weighted smoothness penalty) reached
+585k/1M steps (1952 episodes) with `ep_len_mean` still pinned at exactly
+300 (zero successful episodes, ever) and `ep_rew_mean` flat since 150k
+(-19.4 -> -17.4 over 435k additional steps — essentially no progress).
+User also reported the gripper still vibrating instead of closing at
+checkpoints throughout this run.
+
+**Diagnosis:** this is a genuine plateau, not "still early" — the earlier
+guidance to wait until 150-200k before judging was based on the PREVIOUS
+run's timeline; this run had 3-4x that and showed no improvement.
+Reassessed the whole approach: every fix so far (incidents #9-#12, #14)
+treated SYMPTOMS (release-before-lift, premature closing, chattering) with
+reward-shaping patches. But `scripted_grasp_check.py` already proved the
+task is achievable — meaning the real bottleneck is that **pure RL
+exploration is very unlikely to randomly stumble into the specific
+multi-stage sequence (approach -> descend -> close -> lift -> hold 20
+consecutive steps) needed to ever see the sparse completion reward at
+all**. Reward shaping can bias behavior once the agent is already trying
+similar things, but can't make it discover an entirely unexplored sequence
+faster — that's an exploration problem, not an incentive problem.
+
+**Fix — behavior-cloning warm start**, since we already have a proven-
+successful scripted policy to imitate:
+
+1. `collect_demonstrations.py` (new file): runs the same kind of
+   hand-scripted routine as `scripted_grasp_check.py` across many
+   randomized episodes, keeping the FULL transition sequences
+   (obs, action, reward, next_obs, done) only from episodes that actually
+   succeeded. Saves to `demonstrations.npz`.
+
+2. `train_osc_grasp_bc_parallel.py` (new file, per the project's
+   "dedicated file per training variant" convention — does NOT modify
+   `train_osc_grasp_parallel.py`): before calling `model.learn()`,
+   - **Seeds the replay buffer** with every demonstration transition, so
+     the critic starts with real Q-value signal for the successful
+     trajectory region instead of having to discover it from scratch.
+     Confirmed via reading SB3 source directly (not assumed) that
+     `ReplayBuffer` stores the NORMALIZED ([-1,1], via
+     `policy.scale_action()`) action, not the raw physical-units one —
+     getting this wrong would have silently corrupted every seeded
+     transition. Also confirmed the buffer's action array must be
+     explicitly tiled to shape `(N_ENVS, action_dim)` (obs/reward/done
+     broadcast fine from a single-transition shape via plain numpy
+     broadcasting; the action array does not, since `ReplayBuffer.add`
+     reshapes it exactly rather than broadcasting).
+   - **Pretrains the actor** via supervised MSE regression: the actor's
+     tanh-squashed mean output should match the demonstrated (normalized)
+     action for the demonstrated observation. Verified this produces a
+     genuinely useful policy, not just a shrinking loss number — compared
+     predicted vs. demonstrated actions on held-out demo observations
+     directly and confirmed they match in both direction and magnitude
+     (including correctly near-zero "hold still" actions).
+   - Lowered `learning_starts` from 10,000 to 2,000: confirmed via reading
+     SB3 source that the warmup phase before `learning_starts` uses PURE
+     RANDOM actions regardless of the buffer's actual content or the
+     actor's pretrained weights, so a large value would waste steps
+     ignoring everything just set up. Kept nonzero (not 0) to still
+     collect a little genuine fresh interaction data first.
+   - Same core hyperparameters otherwise as `train_osc_grasp_parallel.py`
+     (`target_entropy=-1.0` from incident #8, etc.) — BC warm-starting
+     addresses the exploration problem specifically, it doesn't replace
+     the entropy-collapse fix that was needed for a different reason.
+
+Smoke-tested the full pipeline (seed buffer -> pretrain actor -> short
+`model.learn()` run) end-to-end without crashing before committing.
+
+**Colab notebook** (`colab_train.ipynb`) updated: new cell 5.5 runs
+`collect_demonstrations.py` (300 successes) before training; cell 6 now
+runs `train_osc_grasp_bc_parallel.py` instead of the pure-RL script. Kept
+entirely on Colab rather than running demo collection locally, consistent
+with moving all training off the user's laptop (see below) — collection is
+lighter-weight (single-threaded, no SubprocVecEnv) than full training, but
+there's no reason to put ANY of this back on the local machine now that
+the whole pipeline lives on Colab.
+
+**Status:** not yet run/verified — this is the first attempt at addressing
+the ROOT cause (exploration) rather than shaping incentives around a
+policy that never finds the target behavior in the first place.
+
 ## Local training paused — migrating to Google Colab
 
 User's laptop was overheating from sustained local training; decided to
