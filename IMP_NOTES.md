@@ -509,9 +509,33 @@ lighter-weight (single-threaded, no SubprocVecEnv) than full training, but
 there's no reason to put ANY of this back on the local machine now that
 the whole pipeline lives on Colab.
 
-**Status:** not yet run/verified — this is the first attempt at addressing
-the ROOT cause (exploration) rather than shaping incentives around a
-policy that never finds the target behavior in the first place.
+**Status:** demonstration collection ran successfully on Colab (300
+successes / 490 attempts, 61% rate, 48,827 transitions — matching local
+testing closely). Training then appeared to hang for 5+ minutes with zero
+output. Root cause: `seed_replay_buffer`'s first version called
+`ReplayBuffer.add()` once per transition in a plain Python loop — each
+call does real work (dict creation, reshaping, conditional checks), and
+across ~49k calls with zero progress printing until the whole loop
+finished, this looked indistinguishable from a hang even though it was
+just slow. Rewritten as a single vectorized bulk write directly into the
+buffer's internal arrays (shapes confirmed via `ReplayBuffer.__init__`'s
+source: observations/actions are `(buffer_size, n_envs, dim)`,
+rewards/dones/timeouts are `(buffer_size, n_envs)` — note `buffer_size`
+here is the ORIGINAL value // N_ENVS, SB3 divides it internally for
+multi-env buffers). Verified correctness directly (not just "it didn't
+crash"): compared the bulk-written buffer contents against what the exact
+same data would produce through the original per-call `.add()` path, byte
+for byte equal. Seeding 48,827 transitions dropped from several minutes to
+0.005s. Also vectorized `pretrain_actor`'s action-scaling (was a similar,
+smaller-scale per-item Python loop) and made its epoch progress print
+every epoch instead of every 10, since a real (non-bulk-array) training
+loop at this data scale is slow enough that sparse printing looked like a
+second hang.
+
+Not yet re-run with the fix — this is the first attempt at addressing the
+ROOT cause (exploration) rather than shaping incentives around a policy
+that never finds the target behavior in the first place, and the fix above
+should let it actually get past setup and into visible training output.
 
 ## Local training paused — migrating to Google Colab
 

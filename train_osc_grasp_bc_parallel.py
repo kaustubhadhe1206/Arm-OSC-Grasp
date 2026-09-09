@@ -23,6 +23,7 @@
 
 import sys
 import os
+import time
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "envs"))
 
@@ -49,31 +50,56 @@ def make_env():
 
 def seed_replay_buffer(model, demo):
     """Adds every demonstration transition to the replay buffer, BEFORE
-    any real training happens. SB3's ReplayBuffer stores the NORMALIZED
-    ([-1,1], via policy.scale_action) action, not the raw physical-units
-    one -- confirmed by reading _store_transition's source directly rather
-    than assuming, since getting this wrong would silently corrupt every
-    seeded transition. The buffer is sized for N_ENVS parallel
-    environments (shape (buffer_size, N_ENVS, ...)); obs/next_obs/reward/
-    done broadcast fine from a single-transition shape via plain numpy
-    broadcasting, but action does NOT (ReplayBuffer.add reshapes it to
-    exactly (N_ENVS, action_dim), which fails on a flat (action_dim,)
-    array) -- so it's tiled explicitly instead."""
-    n_transitions = len(demo["obs"])
-    for i in range(n_transitions):
-        scaled_action = model.policy.scale_action(demo["actions"][i])
-        tiled_action = np.tile(scaled_action, (N_ENVS, 1))
-        infos = [{} for _ in range(N_ENVS)]
-        model.replay_buffer.add(
-            demo["obs"][i],
-            demo["next_obs"][i],
-            tiled_action,
-            np.array(demo["rewards"][i]),
-            np.array(demo["dones"][i]),
-            infos,
-        )
-    print(f"Seeded replay buffer with {n_transitions} demonstration transitions "
-          f"(x{N_ENVS} tiling per transition internally).")
+    any real training happens, via a single vectorized bulk write directly
+    into the buffer's internal arrays -- NOT a Python loop calling
+    ReplayBuffer.add() once per transition, which was the first version of
+    this function and took several minutes with zero progress output for
+    ~49k transitions (each .add() call does a fair amount of work: dict
+    creation, reshaping, conditional checks), badly confusing about
+    whether it had hung. A plain vectorized numpy assignment does the same
+    thing in a fraction of a second.
+
+    SB3's ReplayBuffer stores the NORMALIZED ([-1,1], via
+    policy.scale_action) action, not the raw physical-units one --
+    confirmed by reading _store_transition's source directly rather than
+    assuming, since getting this wrong would silently corrupt every seeded
+    transition. Internal array shapes (confirmed via ReplayBuffer.__init__'s
+    source, not assumed): observations/next_observations are
+    (buffer_size, n_envs, obs_dim), actions is (buffer_size, n_envs,
+    action_dim), rewards/dones/timeouts are (buffer_size, n_envs) — note
+    buffer.buffer_size here is the ORIGINAL buffer_size//N_ENVS (SB3
+    divides it internally for multi-env buffers), not the raw value passed
+    to SAC(). Demo transitions are tiled across the n_envs axis (every
+    parallel env's buffer slot gets an identical copy) rather than trying
+    to spread them across envs, since these are independent successful
+    trajectories, not a real synchronized multi-env rollout — this doesn't
+    need to be aligned with anything, it's just bulk-loading experience."""
+    buffer = model.replay_buffer
+    n = len(demo["obs"])
+    assert n <= buffer.buffer_size, (
+        f"{n} demonstration transitions exceed the per-env replay buffer capacity "
+        f"({buffer.buffer_size}) -- increase buffer_size or collect fewer demos."
+    )
+
+    low, high = model.policy.action_space.low, model.policy.action_space.high
+    scaled_actions = 2.0 * (demo["actions"] - low) / (high - low) - 1.0
+
+    n_envs = buffer.n_envs
+    buffer.observations[0:n] = np.repeat(demo["obs"][:, None, :], n_envs, axis=1)
+    buffer.next_observations[0:n] = np.repeat(demo["next_obs"][:, None, :], n_envs, axis=1)
+    buffer.actions[0:n] = np.repeat(scaled_actions[:, None, :], n_envs, axis=1)
+    buffer.rewards[0:n] = np.repeat(demo["rewards"][:, None], n_envs, axis=1)
+    buffer.dones[0:n] = np.repeat(demo["dones"][:, None].astype(np.float32), n_envs, axis=1)
+    # every kept demo transition is a genuine success (collect_demonstrations.py
+    # discards any episode that ran out of steps without terminating), so
+    # none of these "done" events are timeouts
+    buffer.timeouts[0:n] = 0.0
+
+    buffer.pos = n
+    buffer.full = False
+
+    print(f"Seeded replay buffer with {n} demonstration transitions "
+          f"(x{n_envs} tiling across parallel envs internally).")
 
 
 def pretrain_actor(model, demo):
@@ -84,7 +110,11 @@ def pretrain_actor(model, demo):
     buffer during normal SAC training instead), since BC on the critic
     isn't meaningful (there's no "correct Q-value" label to imitate)."""
     obs = torch.as_tensor(demo["obs"], dtype=torch.float32)
-    scaled_actions = np.array([model.policy.scale_action(a) for a in demo["actions"]], dtype=np.float32)
+    # vectorized, not a per-item Python loop calling policy.scale_action()
+    # (same class of unnecessary-slowness fix as seed_replay_buffer's
+    # rewrite above, though this one was never bad enough to look "stuck")
+    low, high = model.policy.action_space.low, model.policy.action_space.high
+    scaled_actions = 2.0 * (demo["actions"] - low) / (high - low) - 1.0
     actions = torch.as_tensor(scaled_actions, dtype=torch.float32)
 
     actor = model.policy.actor
@@ -93,6 +123,7 @@ def pretrain_actor(model, demo):
     n = obs.shape[0]
     print(f"Pretraining actor on {n} demonstration transitions for {BC_EPOCHS} epochs...")
     for epoch in range(BC_EPOCHS):
+        epoch_start = time.time()
         permutation = torch.randperm(n)
         epoch_loss = 0.0
         n_batches = 0
@@ -111,8 +142,12 @@ def pretrain_actor(model, demo):
 
             epoch_loss += loss.item()
             n_batches += 1
-        if epoch % 10 == 0 or epoch == BC_EPOCHS - 1:
-            print(f"  epoch {epoch}: mse_loss={epoch_loss / n_batches:.5f}")
+        # print every epoch, not every 10 -- at the full ~49k-transition
+        # scale this loop is slow enough (real gradient steps, not a bulk
+        # array op like the buffer seeding above) that long silent gaps
+        # between prints previously looked indistinguishable from "stuck"
+        print(f"  epoch {epoch}: mse_loss={epoch_loss / n_batches:.5f} "
+              f"({time.time() - epoch_start:.1f}s)")
 
 
 if __name__ == "__main__":
