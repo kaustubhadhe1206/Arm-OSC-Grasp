@@ -140,10 +140,12 @@ class FrankaOSCGraspEnv(gymnasium.Env):
         # to a stable grasp, not reaching) gets worked on. Bounds keep the
         # box comfortably clear of the robot's own base (its largest visual
         # geom has a ~0.19m bounding sphere radius, model.geom_rbound) and
-        # well inside the arm's ~0.9m true max reach — this box's corners
-        # are all within a 0.34-0.54m radius of the base.
-        self.object_spawn_x_range = (0.30, 0.45)
-        self.object_spawn_y_range = (0.15, 0.30)
+        # well inside the arm's ~0.9m true max reach. Widened 2x per side
+        # (same center) after the original 0.15x0.15m box looked too small
+        # in the viewer — corners now range 0.24-0.65m from the base,
+        # still comfortably clear of the base and within reach.
+        self.object_spawn_x_range = (0.225, 0.525)
+        self.object_spawn_y_range = (0.075, 0.375)
         self.object_floor_z = 0.015  # half the box's side length, resting flush on the floor
 
         # distance (meters) scale for the proximity reward shaping
@@ -250,8 +252,23 @@ class FrankaOSCGraspEnv(gymnasium.Env):
         # patient grasp attempt. This penalty makes chattering costly
         # regardless of what's motivating it — standard practice in
         # robotics RL specifically to suppress this failure mode.
+        #
+        # Weighted per-dimension (not a plain uniform norm) after testing a
+        # 150k-step checkpoint of a later run: the ARM positioned itself
+        # precisely and held rock-steady (confirming the uniform 0.05
+        # weight was already enough there), while the GRIPPER specifically
+        # kept vibrating in place instead of closing, right at the point of
+        # deciding to grasp — and this was observed under DETERMINISTIC
+        # evaluation (test_osc_grasp.py uses deterministic=True), so it's a
+        # genuine oscillation baked into the learned policy's mean output,
+        # not sampling noise. Since the arm dimensions were already fine at
+        # the old weight, a targeted, much heavier penalty on JUST the
+        # gripper dimension should suppress this without over-damping
+        # legitimate arm movement.
+        smoothness_weights = np.array([1.0, 1.0, 1.0, 1.0, 4.0])
         normalized_action = action / self.action_space.high
-        action_change = np.linalg.norm(normalized_action - self.prev_action_normalized)
+        weighted_diff = smoothness_weights * (normalized_action - self.prev_action_normalized)
+        action_change = np.linalg.norm(weighted_diff)
         action_smoothness_penalty = 0.05 * action_change
         self.prev_action_normalized = normalized_action
 

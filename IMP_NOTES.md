@@ -393,6 +393,44 @@ box/episode length from this session. This is the first run with a
 confirmed-achievable configuration underneath it, not just a reward patch
 on top of an unverified environment.
 
+## Incident #14 — Gripper vibration persisted; targeted a heavier, gripper-specific smoothness penalty
+
+**Symptom:** testing a 150k-step checkpoint of the run built on incident
+#13's fixes showed the arm approaching and positioning itself precisely
+above the object every time (confirming the controller-speed and
+spawn-box fixes worked for the approach phase) — but the gripper
+vibrated in place instead of closing, until the episode timed out. Same
+category of failure as incident #12, but incident #12's fix (a uniform
+0.05-weighted action-smoothness penalty) evidently wasn't enough to
+suppress it. Notable: this was observed under `deterministic=True`
+evaluation, so it's a real oscillation in the trained policy's mean
+output, not exploration sampling noise.
+
+**Fix (`envs/franka_osc_grasp_env.py`):** since the ARM dimensions were
+already stable at the old uniform weight (confirmed by the precise,
+steady positioning), weighted the smoothness penalty per-dimension instead
+of uniformly, applying 4x the weight to just the gripper dimension:
+`smoothness_weights = [1, 1, 1, 1, 4]`. Targets the specific dimension
+that's actually chattering without over-damping arm movement that already
+works.
+
+**Also widened the spawn box 2x per side** (same center) — the original
+0.15x0.15m looked too small in the viewer. Re-ran `scripted_grasp_check.py`
+several times to confirm this didn't break achievability: success rate
+dropped from 3/3 to roughly 5/8, but the failures are explained by the
+script's FIXED per-phase step budgets (tuned for the smaller box) not
+always being enough for the wider box's longer edge-case distances, not by
+any environment/reward regression — the two observed failure patterns
+(dropping the object right at the last hold step, or never getting a
+stable grip in the first place) are consistent with a rigid, non-adaptive
+script running low on budget, not a fundamental issue. Not worth tuning
+the script further to compensate — an RL policy uses its full episode
+budget adaptively, unlike this fixed-phase script, so this doesn't
+threaten the achievability finding from incident #13.
+
+**Status:** not yet verified — training restarted from scratch again
+(reward function changed).
+
 ## Local training paused — migrating to Google Colab
 
 User's laptop was overheating from sustained local training; decided to
